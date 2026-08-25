@@ -48,6 +48,14 @@ type SubscribeResult struct {
 	Expires    int
 }
 
+// DTMFInfoEvent DTMF INFO 事件（来自 SIP INFO 方法的 DTMF）。
+type DTMFInfoEvent struct {
+	Digit    rune // DTMF 数字 ('0'-'9', '*', '#', 'A'-'D')
+	Duration int  // 持续时间（毫秒）
+	CallID   string
+	From     string
+}
+
 // Listener UAS 事件监听器接口。
 type Listener interface {
 	OnIncomingCall(handle CallHandle, req *message.Request) bool
@@ -56,6 +64,9 @@ type Listener interface {
 	OnCancel(handle CallHandle, cancel *message.Request)
 	OnRegister(req *message.Request) (*RegisterResult, error)
 	OnSubscribe(req *message.Request) (*SubscribeResult, error)
+	// OnDTMFEvent DTMF 事件回调（SIP INFO 方法）。
+	// 返回 nil 表示正常处理，返回 error 表示处理失败。
+	OnDTMFEvent(handle CallHandle, event *DTMFInfoEvent) error
 	OnError(handle CallHandle, err error)
 }
 
@@ -351,7 +362,183 @@ func (u *uas) handleRefer(req *message.Request) {
 }
 
 func (u *uas) handleInfo(req *message.Request) {
+	// 检查是否为 DTMF INFO 请求
+	contentType := req.Headers.Get(message.HdrContentType)
+	if contentType == "application/dtmf-relay" {
+		u.handleDTMFInfo(req)
+		return
+	}
+
+	// 非 DTMF 的 INFO 请求，尝试匹配到现有呼叫
+	callID := req.CallID()
+	u.calls.Range(func(key, value interface{}) bool {
+		ic := value.(*incomingCall)
+		if ic.callID == callID {
+			// 转发给监听器
+			u.mu.RLock()
+			listener := u.listener
+			u.mu.RUnlock()
+			if listener != nil {
+				if err := listener.OnIncomingRequest(ic.handle, req); err != nil {
+					u.sendResponse(req, 500, "Server Internal Error", nil)
+					return false
+				}
+			}
+			return false
+		}
+		return true
+	})
+
 	u.sendResponse(req, 200, "OK", nil)
+}
+
+// handleDTMFInfo 处理 DTMF INFO 请求（application/dtmf-relay）。
+// 解析 INFO 请求体中的 Signal 和 Duration 字段，并回调监听器。
+func (u *uas) handleDTMFInfo(req *message.Request) {
+	callID := req.CallID()
+
+	// 解析 DTMF 事件体
+	digit, duration, err := parseDTMFBody(req.Body)
+	if err != nil {
+		u.log.Warn("uas", "failed to parse DTMF INFO body: %v", err)
+		u.sendResponse(req, 400, "Bad Request - Invalid DTMF", nil)
+		return
+	}
+
+	event := &DTMFInfoEvent{
+		Digit:    digit,
+		Duration: duration,
+		CallID:   callID,
+		From:     req.Headers.Get(message.HdrFrom),
+	}
+
+	// 查找匹配的呼叫
+	var found bool
+	u.calls.Range(func(key, value interface{}) bool {
+		ic := value.(*incomingCall)
+		if ic.callID == callID {
+			u.mu.RLock()
+			listener := u.listener
+			u.mu.RUnlock()
+
+			if listener != nil {
+				if err := listener.OnDTMFEvent(ic.handle, event); err != nil {
+					u.log.Warn("uas", "DTMF event callback error: %v", err)
+					u.sendResponse(req, 500, "Server Internal Error", nil)
+					return false
+				}
+			}
+
+			u.sendResponse(req, 200, "OK", nil)
+			u.log.Debug("uas", "call %d received DTMF digit '%c' duration=%dms",
+				ic.handle, digit, duration)
+			found = true
+			return false
+		}
+		return true
+	})
+
+	if !found {
+		// 未找到匹配的呼叫，仍然回复 200 以避免重试
+		u.log.Warn("uas", "received DTMF INFO for unknown call (Call-ID: %s)", callID)
+		u.sendResponse(req, 200, "OK", nil)
+	}
+}
+
+// parseDTMFBody 解析 DTMF INFO 请求体。
+// 格式：Signal=X\r\nDuration=Y
+func parseDTMFBody(body []byte) (rune, int, error) {
+	if len(body) == 0 {
+		return 0, 0, errors.New("uas: empty DTMF body")
+	}
+
+	var digit rune
+	var duration int
+	digitFound := false
+	durationFound := false
+
+	// 按行解析
+	lines := splitDTMFLines(string(body))
+	for _, line := range lines {
+		line = trimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		if hasPrefix(line, "Signal=") {
+			val := line[7:]
+			if len(val) > 0 {
+				digit = rune(val[0])
+				digitFound = true
+			}
+		} else if hasPrefix(line, "Duration=") {
+			val := line[9:]
+			for _, c := range val {
+				if c >= '0' && c <= '9' {
+					duration = duration*10 + int(c-'0')
+				} else {
+					break
+				}
+			}
+			durationFound = true
+		}
+	}
+
+	if !digitFound {
+		return 0, 0, errors.New("uas: missing Signal field in DTMF body")
+	}
+	if !durationFound {
+		duration = 160 // 默认 20ms
+	}
+
+	// 验证 DTMF 数字
+	switch digit {
+	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+		'*', '#', 'A', 'B', 'C', 'D', 'a', 'b', 'c', 'd':
+		// 有效
+	default:
+		return 0, 0, fmt.Errorf("uas: invalid DTMF digit: %c", digit)
+	}
+
+	return digit, duration, nil
+}
+
+// splitDTMFLines 按行分割 DTMF 请求体。
+func splitDTMFLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			line := s[start:i]
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
+			lines = append(lines, line)
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+// trimSpace 去除首尾空白字符。
+func trimSpace(s string) string {
+	start := 0
+	for start < len(s) && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n') {
+		start++
+	}
+	end := len(s)
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\r' || s[end-1] == '\n') {
+		end--
+	}
+	return s[start:end]
+}
+
+// hasPrefix 检查字符串是否有指定前缀。
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
 func (u *uas) handleUpdate(req *message.Request) {
